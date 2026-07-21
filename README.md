@@ -2,7 +2,7 @@
 
 This repository provides a production-ready, mathematically verified memory optimization for Reinforcement Learning from Human Feedback (RLHF) via Proximal Policy Optimization (PPO). By dynamically enabling and disabling PEFT (e.g., LoRA) adapters on a single instance of model weights, this framework **eliminates the separate, frozen Reference model footprint entirely**, saving up to **50% of policy-associated VRAM**.
 
-This enables local hardware (like an RTX 4060 Ti 8GB) to run 8B+ model RLHF sweeps that would otherwise trigger a `CUDA Out Of Memory` (OOM) error.
+Because the technique removes one full copy of the model weights, it raises the model size an 8GB card (like an RTX 4060 Ti) can fit before hitting `CUDA Out Of Memory` (OOM). The included benchmark demonstrates this directly on a 3B model (see [Empirical Benchmark Results](#empirical-benchmark-results)); the same mechanism scales to larger models, though the 8B case is not benchmarked here.
 
 ---
 
