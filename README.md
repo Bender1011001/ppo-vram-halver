@@ -136,5 +136,21 @@ loss, p_loss, kl_penalty, val_loss = step_ppo_dual_pass(
 
 * `rlhf_dual_pass.py`: Core implementation containing the `SingleModelPPOLoss` class and training loop wrappers.
 * `benchmark_rlhf.py`: Profiling script used to measure and compare peak memory.
-* `tests/verify_rlhf.py`: E2E verification test running the benchmark offline and asserting memory savings.
+* `tests/verify_rlhf.py`: E2E verification test that runs both benchmark arms in separate processes and asserts at least a 35% peak-VRAM saving.
+
+### Reproducing the benchmark
+
+The benchmark is **not** CPU- or offline-runnable. `benchmark_rlhf.py` calls
+`.cuda()` and loads `Qwen/Qwen2.5-3B-Instruct` via `from_pretrained`, so it needs:
+
+- an NVIDIA GPU with CUDA (the reported run used an 8GB RTX 4060 Ti),
+- roughly 6GB of free disk and a network connection the first time, to fetch the
+  model weights from Hugging Face.
+
+```bash
+python tests/verify_rlhf.py
+```
+
+The standard-PPO arm is *expected* to OOM on an 8GB card — that is the result
+being demonstrated, not a failure of the script.
 * `notebooks/RLHF_Dual_Pass_Colab.ipynb`: Complete, interactive Google Colab notebook.
