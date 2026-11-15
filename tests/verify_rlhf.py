@@ -12,6 +12,22 @@ import subprocess
 import re
 from pathlib import Path
 
+
+def parse_benchmark_result(result, label):
+    """Return peak MiB, or None only for a confirmed CUDA OOM."""
+    output = result.stdout + "\n" + result.stderr
+    if result.returncode != 0:
+        if re.search(r"cuda.{0,30}out of memory", output, re.IGNORECASE):
+            return None
+        raise RuntimeError(f"{label} benchmark exited with code {result.returncode}:\n{output}")
+    if "CUDA OUT OF MEMORY" in result.stdout:
+        return None
+    match = re.search(rf"{re.escape(label)} Peak:\s+([\d.]+)\s+MiB", result.stdout)
+    if match is None:
+        raise ValueError(f"Could not parse {label} peak VRAM from benchmark output")
+    return float(match.group(1))
+
+
 def main():
     project_root = Path(__file__).resolve().parent.parent
     benchmark_script = project_root / "benchmark_rlhf.py"
@@ -37,23 +53,12 @@ def main():
         print("=== Standard PPO Error ===")
         print(res_standard.stderr)
         
-    standard_vram = None
-    standard_oom = False
-    
-    # Determine if standard step succeeded or crashed/OOMed
-    if res_standard.returncode != 0 or "CUDA OUT OF MEMORY" in res_standard.stdout or "out of memory" in res_standard.stderr.lower():
-        print("[!] Standard PPO step crashed or ran out of memory as expected on this GPU!")
-        standard_oom = True
-        standard_vram = float("inf")
-    else:
-        # Parse standard PPO peak VRAM
-        standard_match = re.search(r"Standard PPO Peak:\s+([\d\.]+)\s+MiB", res_standard.stdout)
-        if standard_match:
-            standard_vram = float(standard_match.group(1))
-        else:
-            print("[!] Standard PPO step failed or output could not be parsed.")
-            standard_oom = True
-            standard_vram = float("inf")
+    try:
+        standard_vram = parse_benchmark_result(res_standard, "Standard PPO")
+    except (RuntimeError, ValueError) as exc:
+        print(f"[-] ERROR: {exc}")
+        sys.exit(1)
+    standard_oom = standard_vram is None
             
     # 2. Run Single-Model Dual-Pass PPO Step in a separate process
     cmd_dual = [
@@ -71,24 +76,21 @@ def main():
         print("=== Single-Model PPO Error ===")
         print(res_dual.stderr)
         
-    if res_dual.returncode != 0:
-        print(f"[-] ERROR: Single-Model PPO step crashed with exit code {res_dual.returncode}")
+    try:
+        dual_pass_vram = parse_benchmark_result(res_dual, "Single-Model PPO")
+    except (RuntimeError, ValueError) as exc:
+        print(f"[-] ERROR: {exc}")
         sys.exit(1)
-        
-    # Parse dual-pass PPO peak VRAM
-    dual_pass_match = re.search(r"Single-Model PPO Peak:\s+([\d\.]+)\s+MiB", res_dual.stdout)
-    if not dual_pass_match:
-        print("[-] ERROR: Could not parse Single-Model PPO peak VRAM.")
+    if dual_pass_vram is None:
+        print("[-] ERROR: Single-Model PPO ran out of CUDA memory")
         sys.exit(2)
-        
-    dual_pass_vram = float(dual_pass_match.group(1))
     
     # Compare results
     print(f"\n============================================================")
     print(f" COMPARISON SUMMARY")
     print(f"============================================================")
     if standard_oom:
-        print(f"  Standard PPO Peak:        CUDA OUT OF MEMORY (> 8,188 MiB)")
+        print("  Standard PPO Peak:        CUDA OUT OF MEMORY")
     else:
         print(f"  Standard PPO Peak:        {standard_vram:.2f} MiB")
     print(f"  Single-Model PPO Peak:    {dual_pass_vram:.2f} MiB")

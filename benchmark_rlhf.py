@@ -13,7 +13,7 @@ import torch
 import torch.nn as nn
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from peft import LoraConfig, get_peft_model
-from rlhf_dual_pass import step_ppo_dual_pass
+from rlhf_dual_pass import SingleModelPPOLoss, step_ppo_dual_pass
 
 def get_gpu_memory_allocated():
     """Returns currently allocated GPU memory in MiB."""
@@ -37,14 +37,13 @@ def run_standard_ppo_step(model_name, lora_config, inputs, ppo_inputs):
     get_peak_gpu_memory()  # Reset peak tracker
     
     start_mem = get_gpu_memory_allocated()
-    print(f"  Starting VRAM: {start_mem:.2f} MiB")
+    print(f"  Starting PyTorch CUDA allocation: {start_mem:.2f} MiB")
     
     # 1. Load Actor Model (Active with LoRA)
     print("  Loading Actor model with LoRA...")
     actor_base = AutoModelForCausalLM.from_pretrained(
         model_name,
-        torch_dtype=torch.bfloat16,
-        trust_remote_code=True
+        dtype=torch.bfloat16,
     ).cuda()
     actor = get_peft_model(actor_base, lora_config)
     actor.train()
@@ -53,8 +52,7 @@ def run_standard_ppo_step(model_name, lora_config, inputs, ppo_inputs):
     print("  Loading separate Reference model (frozen)...")
     reference = AutoModelForCausalLM.from_pretrained(
         model_name,
-        torch_dtype=torch.bfloat16,
-        trust_remote_code=True
+        dtype=torch.bfloat16,
     ).cuda().eval()
     
     # 3. Create Value Head (Critic)
@@ -62,32 +60,23 @@ def run_standard_ppo_step(model_name, lora_config, inputs, ppo_inputs):
     value_head = nn.Linear(hidden_size, 1).cuda().to(torch.bfloat16).train()
     
     loaded_mem = get_gpu_memory_allocated()
-    print(f"  VRAM after loading models and critic: {loaded_mem:.2f} MiB (Delta: {loaded_mem - start_mem:.2f} MiB)")
+    print(f"  Allocation after loading models and critic: {loaded_mem:.2f} MiB (Delta: {loaded_mem - start_mem:.2f} MiB)")
     
     # Define optimizer
     optimizer = torch.optim.AdamW(list(actor.parameters()) + list(value_head.parameters()), lr=1e-5)
     optimizer.zero_grad()
     
     # 4. Reference pass (on reference model)
+    loss_fn = SingleModelPPOLoss()
     with torch.no_grad():
         ref_outputs = reference(
             input_ids=inputs["input_ids"],
             attention_mask=inputs["attention_mask"],
             use_cache=False,
-            output_hidden_states=True
+            output_hidden_states=False
         )
-        ref_logits = ref_outputs.logits.detach()
-        
-    # Get reference log probabilities over action space
-    shift_ref_logits = ref_logits[..., :-1, :].contiguous()
-    shift_labels = inputs["input_ids"][..., 1:].contiguous()
-    ref_log_probs_all = torch.log_softmax(shift_ref_logits, dim=-1)
-    
-    mask = (shift_labels != -100)
-    gather_labels = shift_labels.clone()
-    gather_labels[~mask] = 0
-    ref_log_probs = torch.gather(ref_log_probs_all, dim=-1, index=gather_labels.unsqueeze(-1)).squeeze(-1)
-    ref_log_probs = ref_log_probs * mask.float() * ppo_inputs["action_masks"][..., 1:]
+        ref_log_probs, _ = loss_fn.get_log_probs(ref_outputs.logits, inputs["input_ids"])
+    del ref_outputs
     
     # 5. Actor pass (on actor model)
     actor_outputs = actor(
@@ -101,49 +90,53 @@ def run_standard_ppo_step(model_name, lora_config, inputs, ppo_inputs):
     # Value function hidden states
     hidden_states = actor_outputs.hidden_states[-1]
     values = value_head(hidden_states).squeeze(-1)
-    values = values[..., :-1] * ppo_inputs["action_masks"][..., 1:]
     
     # Get actor log probabilities over action space
-    shift_actor_logits = actor_logits[..., :-1, :].contiguous()
-    actor_log_probs_all = torch.log_softmax(shift_actor_logits, dim=-1)
-    actor_log_probs = torch.gather(actor_log_probs_all, dim=-1, index=gather_labels.unsqueeze(-1)).squeeze(-1)
-    actor_log_probs = actor_log_probs * mask.float() * ppo_inputs["action_masks"][..., 1:]
+    actor_log_probs, token_mask = loss_fn.get_log_probs(actor_logits, inputs["input_ids"])
+    active = token_mask & ppo_inputs["action_masks"][..., 1:].bool() & inputs["attention_mask"][..., 1:].bool()
+    mask_float = active.float()
+    token_counts = mask_float.sum(dim=-1).clamp_min(1)
     
     # 6. Compute PPO losses
     # Ratios
-    ratios = torch.exp(actor_log_probs - ppo_inputs["old_log_probs"][..., 1:])
-    surr1 = ratios * ppo_inputs["advantages"][..., 1:]
-    surr2 = torch.clamp(ratios, 0.8, 1.2) * ppo_inputs["advantages"][..., 1:]
+    log_ratios = torch.where(active, actor_log_probs - ppo_inputs["old_log_probs"][..., 1:], 0.0)
+    ratios = torch.exp(log_ratios)
+    masked_advantages = torch.where(active, ppo_inputs["advantages"][..., 1:], 0.0)
+    surr1 = ratios * masked_advantages
+    surr2 = torch.clamp(ratios, 0.8, 1.2) * masked_advantages
     
-    mask_float = (mask * ppo_inputs["action_masks"][..., 1:]).float()
     policy_loss = -torch.sum(torch.min(surr1, surr2) * mask_float, dim=-1)
-    policy_loss = torch.mean(policy_loss / (torch.sum(mask_float, dim=-1) + 1e-8))
+    policy_loss = torch.mean(policy_loss / token_counts)
     
-    kl_div = actor_log_probs - ref_log_probs
+    kl_div = torch.where(active, actor_log_probs - ref_log_probs, 0.0)
     kl_penalty = torch.sum(kl_div * mask_float, dim=-1)
-    kl_penalty = torch.mean(kl_penalty / (torch.sum(mask_float, dim=-1) + 1e-8))
+    kl_penalty = torch.mean(kl_penalty / token_counts)
     
     # Value loss
-    values_clipped = ppo_inputs["old_values"][..., 1:] + torch.clamp(
-        values - ppo_inputs["old_values"][..., 1:], -0.2, 0.2
+    values = torch.where(active, values[..., :-1], 0.0)
+    prior_values = torch.where(active, ppo_inputs["old_values"][..., 1:], 0.0)
+    targets = torch.where(active, ppo_inputs["returns"][..., 1:], 0.0)
+    values_clipped = prior_values + torch.clamp(
+        values - prior_values, -0.2, 0.2
     )
-    vf_losses1 = (values - ppo_inputs["returns"][..., 1:]) ** 2
-    vf_losses2 = (values_clipped - ppo_inputs["returns"][..., 1:]) ** 2
+    vf_losses1 = (values - targets) ** 2
+    vf_losses2 = (values_clipped - targets) ** 2
     vf_loss = 0.5 * torch.sum(torch.max(vf_losses1, vf_losses2) * mask_float, dim=-1)
-    value_loss = torch.mean(vf_loss / (torch.sum(mask_float, dim=-1) + 1e-8))
+    value_loss = torch.mean(vf_loss / token_counts)
     
     total_loss = policy_loss + 0.01 * kl_penalty + value_loss
     
     # 7. Backward pass
     total_loss.backward()
     optimizer.step()
-    
+    torch.cuda.synchronize()
+
     peak_mem = get_peak_gpu_memory()
-    print(f"  Peak VRAM during execution: {peak_mem:.2f} MiB")
+    print(f"  Peak PyTorch CUDA allocation: {peak_mem:.2f} MiB")
     
     # Cleanup memory
     del reference, actor, actor_base, value_head, total_loss, policy_loss, kl_penalty, value_loss
-    del ref_logits, actor_logits, values, ratios, surr1, surr2
+    del actor_logits, values, ratios, surr1, surr2
     gc.collect()
     torch.cuda.empty_cache()
     
@@ -157,14 +150,13 @@ def run_single_model_ppo_step(model_name, lora_config, inputs, ppo_inputs):
     get_peak_gpu_memory()  # Reset peak tracker
     
     start_mem = get_gpu_memory_allocated()
-    print(f"  Starting VRAM: {start_mem:.2f} MiB")
+    print(f"  Starting PyTorch CUDA allocation: {start_mem:.2f} MiB")
     
     # 1. Load Single Actor Model (Active with LoRA)
     print("  Loading single Actor model with LoRA...")
     actor_base = AutoModelForCausalLM.from_pretrained(
         model_name,
-        torch_dtype=torch.bfloat16,
-        trust_remote_code=True
+        dtype=torch.bfloat16,
     ).cuda()
     actor = get_peft_model(actor_base, lora_config)
     actor.train()
@@ -174,7 +166,7 @@ def run_single_model_ppo_step(model_name, lora_config, inputs, ppo_inputs):
     value_head = nn.Linear(hidden_size, 1).cuda().to(torch.bfloat16).train()
     
     loaded_mem = get_gpu_memory_allocated()
-    print(f"  VRAM after loading single model and critic: {loaded_mem:.2f} MiB (Delta: {loaded_mem - start_mem:.2f} MiB)")
+    print(f"  Allocation after loading single model and critic: {loaded_mem:.2f} MiB (Delta: {loaded_mem - start_mem:.2f} MiB)")
     
     # Define optimizer
     optimizer = torch.optim.AdamW(list(actor.parameters()) + list(value_head.parameters()), lr=1e-5)
@@ -195,8 +187,9 @@ def run_single_model_ppo_step(model_name, lora_config, inputs, ppo_inputs):
         clip_range=0.2
     )
     
+    torch.cuda.synchronize()
     peak_mem = get_peak_gpu_memory()
-    print(f"  Peak VRAM during execution: {peak_mem:.2f} MiB")
+    print(f"  Peak PyTorch CUDA allocation: {peak_mem:.2f} MiB")
     
     # Cleanup memory
     del actor, actor_base, value_head, optimizer
@@ -233,21 +226,19 @@ def main():
     print(f"============================================================")
     
     # Initialize tokenizer and inputs
-    try:
-        tokenizer = AutoTokenizer.from_pretrained(args.model_name, trust_remote_code=True)
-    except Exception as e:
-        print(f"Tokenizer load failed, using gpt2 tokenizer fallback: {e}")
-        tokenizer = AutoTokenizer.from_pretrained("gpt2")
+    tokenizer = AutoTokenizer.from_pretrained(args.model_name)
         
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
         
-    # Dummy sequence batch: batch_size=2, sequence_length=256
+    # Synthetic batch; max_length is a cap, not a fixed sequence length.
+    torch.manual_seed(0)
     dummy_text = ["RLHF alignment tuning involves updating policy models while measuring divergence from the reference policy."] * 2
     inputs = tokenizer(dummy_text, return_tensors="pt", padding=True, truncation=True, max_length=256)
     inputs = {k: v.cuda() for k, v in inputs.items()}
     
     batch_size, seq_len = inputs["input_ids"].shape
+    print(f" Tokenized batch: {batch_size} x {seq_len} tokens")
     
     # Setup dummy PPO trajectory states
     action_masks = torch.zeros((batch_size, seq_len), device="cuda")
@@ -306,13 +297,13 @@ def main():
     print(f"============================================================")
     if standard_vram is not None:
         if standard_vram == float("inf"):
-            print(f"  Standard PPO Peak:        CUDA OUT OF MEMORY (> 8,188 MiB)")
+            print("  Standard PPO Peak:        CUDA OUT OF MEMORY")
         else:
             print(f"  Standard PPO Peak:        {standard_vram:.2f} MiB")
         
     if dual_pass_vram is not None:
         if dual_pass_vram == float("inf"):
-            print(f"  Single-Model PPO Peak:    CUDA OUT OF MEMORY (> 8,188 MiB)")
+            print("  Single-Model PPO Peak:    CUDA OUT OF MEMORY")
         else:
             print(f"  Single-Model PPO Peak:    {dual_pass_vram:.2f} MiB")
         
